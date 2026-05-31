@@ -200,7 +200,7 @@ func recordingTee(w io.WriteCloser, r io.ReadCloser, t io.Writer, recorder func(
 	if t != nil {
 		wc = io.MultiWriter(t, w) // we want to prioritize t for interaction log
 	}
-	n, err := io.Copy(wc, r)
+	n, err := copyPipeWithTap(w, r, wc)
 	if recorder != nil {
 		recorder(n, err)
 	}
@@ -245,11 +245,43 @@ func recordDirection(recorder PipeResultRecorder, direction int) func(int64, err
 	}
 }
 
+const maxInteractionLogBytes int64 = 8196 + 1
+
 type InteractionLog struct {
 	writer               *bufio.Writer
 	mutex                sync.RWMutex
 	hadEol               bool
 	currentLineDirection int
+	written              int64
+	maxBytes             int64
+}
+
+func (w *InteractionLog) writeBytes(p []byte) (n int, complete bool, err error) {
+	if len(p) == 0 {
+		return 0, true, nil
+	}
+
+	complete = true
+	if w.maxBytes > 0 {
+		remaining := w.maxBytes - w.written
+		if remaining <= 0 {
+			return 0, false, nil
+		}
+		if int64(len(p)) > remaining {
+			p = p[:int(remaining)]
+			complete = false
+		}
+	}
+
+	n, err = w.writer.Write(p)
+	w.written += int64(n)
+	if err != nil {
+		return n, false, err
+	}
+	if n != len(p) {
+		return n, false, io.ErrShortWrite
+	}
+	return n, complete, nil
 }
 
 func (w *InteractionLog) write(direction int, p []byte) (n int, err error) {
@@ -259,6 +291,9 @@ func (w *InteractionLog) write(direction int, p []byte) (n int, err error) {
 
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
+	if w.maxBytes > 0 && w.written >= w.maxBytes {
+		return len(p), nil
+	}
 
 	eol := []byte("\n")
 	// When direction switches without eol written
@@ -275,6 +310,7 @@ func (w *InteractionLog) write(direction int, p []byte) (n int, err error) {
 	lines := bytes.Split(p, eol)
 	for i, line := range lines {
 		var wn int
+		var complete bool
 
 		if i+1 >= len(lines) && len(line) == 0 {
 			break
@@ -282,45 +318,41 @@ func (w *InteractionLog) write(direction int, p []byte) (n int, err error) {
 
 		if direction != w.currentLineDirection {
 			if !w.hadEol {
-				wn, err = w.writer.Write(switch_without_eol)
+				_, complete, err = w.writeBytes(switch_without_eol)
 				if err != nil {
 					return
 				}
-				if wn != len(switch_without_eol) {
-					err = io.ErrShortWrite
-					return
+				if !complete {
+					return len(p), nil
 				}
 			}
 
 			w.currentLineDirection = direction
-			wn, err = w.writer.Write(prefix)
+			_, complete, err = w.writeBytes(prefix)
 			if err != nil {
 				return
 			}
-			if wn != len(prefix) {
-				err = io.ErrShortWrite
-				return
+			if !complete {
+				return len(p), nil
 			}
 		}
 
-		wn, err = w.writer.Write(line)
+		wn, complete, err = w.writeBytes(line)
 		n += wn
 		if err != nil {
 			return
 		}
-		if wn != len(line) {
-			err = io.ErrShortWrite
-			return
+		if !complete {
+			return len(p), nil
 		}
 		if i+1 < len(lines) {
-			wn, err = w.writer.Write(eol)
+			wn, complete, err = w.writeBytes(eol)
 			n += wn
 			if err != nil {
 				return
 			}
-			if wn != len(eol) {
-				err = io.ErrShortWrite
-				return
+			if !complete {
+				return len(p), nil
 			}
 			w.hadEol = true
 			w.currentLineDirection = -1
@@ -365,17 +397,18 @@ func Interconnect(s1, s2 *Subprocess, d1, d2, interactionLogFile *os.File, recor
 	wg.Add(2)
 
 	if interactionLogFile != nil {
-		writer := bufio.NewWriter(interactionLogFile)
+		writer := bufio.NewWriterSize(interactionLogFile, int(maxInteractionLogBytes))
+		interactionLog := &InteractionLog{
+			writer:               writer,
+			hadEol:               true,
+			currentLineDirection: -1,
+			maxBytes:             maxInteractionLogBytes,
+		}
 		go func() {
 			wg.Wait()
 			err := writer.Flush()
 			_ = err // TODO ???
 		}()
-		interactionLog := &InteractionLog{
-			writer:               writer,
-			hadEol:               true,
-			currentLineDirection: -1,
-		}
 		w1 = &InteractionLogWriter{
 			interactionLog: interactionLog,
 			direction:      0,
